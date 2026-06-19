@@ -72,13 +72,22 @@ async function handleSend(body: Record<string, string>) {
   const user = await im.user(phone);
   const space = await im.space(user);
 
+  let msg: unknown;
   if (respondingTo) {
-    await space.send(text);
+    msg = await space.send(text);
   } else {
-    await space.send(text);
+    msg = await space.send(text);
   }
 
-  return { ok: true, clientGuid: clientGuid ?? null };
+  const id =
+    (msg as any)?.id ??
+    (msg as any)?.clientGuid ??
+    (msg as any)?.guid ??
+    (msg as any)?.messageId ??
+    clientGuid ??
+    crypto.randomUUID();
+
+  return { ok: true, clientGuid: id, id };
 }
 
 async function handleMarkRead(body: Record<string, string>) {
@@ -124,7 +133,13 @@ async function handleSendAttachment(body: Record<string, string>) {
   const space = await im.space(user);
   const msg = await space.send(attachment(buf, { name: filename, mimeType: mime }));
 
-  return { ok: true, id: (msg as any)?.id, clientGuid: (msg as any)?.clientGuid };
+  const id =
+    (msg as any)?.id ??
+    (msg as any)?.clientGuid ??
+    (msg as any)?.guid ??
+    crypto.randomUUID();
+
+  return { ok: true, id, clientGuid: id };
 }
 
 async function handleGetAttachment(body: Record<string, string>) {
