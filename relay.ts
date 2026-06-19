@@ -16,17 +16,82 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { Spectrum } from "spectrum-ts";
 import { imessage } from "spectrum-ts/providers/imessage";
 
-// ─── Init Spectrum ────────────────────────────────────────────────────────────
+// ─── Connexion Spectrum (avec reconnexion) ─────────────────────────────────────
 
-const app = await Spectrum({
-  projectId: process.env.PROJECT_ID!,
-  projectSecret: process.env.PROJECT_SECRET!,
-  providers: [imessage.config()],
-});
+let app: Awaited<ReturnType<typeof Spectrum>>;
+let im: ReturnType<typeof imessage>;
 
-const im = imessage(app);
+async function connect() {
+  app = await Spectrum({
+    projectId: process.env.PROJECT_ID!,
+    projectSecret: process.env.PROJECT_SECRET!,
+    providers: [imessage.config()],
+  });
+  im = imessage(app);
+  console.log("[relay] Spectrum connected");
+}
 
-console.log("[relay] Spectrum connected");
+await connect();
+
+// ─── Détection des erreurs de connexion + reconnexion ──────────────────────────
+
+const CONNECTION_ERROR_PATTERNS = [
+  "connection dropped",
+  "no connection established",
+  "failed to connect",
+  "connection closed",
+  "connection reset",
+  "econnreset",
+  "socket hang up",
+  "stream closed",
+  "upstream",
+];
+
+function isConnectionError(err: unknown): boolean {
+  const msg = (err instanceof Error ? err.message : String(err)).toLowerCase();
+  return CONNECTION_ERROR_PATTERNS.some((p) => msg.includes(p));
+}
+
+const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+// Dédupe : si plusieurs requêtes échouent en même temps, elles partagent
+// la même reconnexion au lieu d'en déclencher une chacune.
+let reconnecting: Promise<void> | null = null;
+
+function reconnect(): Promise<void> {
+  if (reconnecting) return reconnecting;
+  reconnecting = (async () => {
+    console.warn("[relay] connexion perdue — reconnexion Spectrum…");
+    try {
+      await app?.stop();
+    } catch {
+      /* best-effort : l'ancienne connexion est déjà morte */
+    }
+    await connect();
+  })().finally(() => {
+    reconnecting = null;
+  });
+  return reconnecting;
+}
+
+/**
+ * Exécute `fn`. Si elle échoue avec une erreur de connexion upstream,
+ * on reconnecte Spectrum puis on réessaie UNE fois.
+ *
+ * Note : sans danger pour /send ici car les drops échouent vite
+ * (avant que le message ne parte), donc pas de double envoi.
+ */
+async function withReconnect<T>(label: string, fn: () => Promise<T>): Promise<T> {
+  try {
+    return await fn();
+  } catch (err) {
+    if (!isConnectionError(err)) throw err;
+    console.warn(`[relay] ${label}: ${(err as Error).message} → reconnexion + retry`);
+    await reconnect();
+    await sleep(300); // laisse la connexion se stabiliser
+    return await fn();
+  }
+}
 
 // ─── Auth middleware ──────────────────────────────────────────────────────────
 
@@ -66,18 +131,14 @@ function json(res: ServerResponse, status: number, body: unknown) {
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
 async function handleSend(body: Record<string, string>) {
-  const { phone, text, clientGuid, respondingTo } = body;
-  console.log('[relay] send attempt:', { phone, textLen: text?.length });
+  const { phone, text, clientGuid } = body;
+  console.log("[relay] send attempt:", { phone, textLen: text?.length });
 
-  const user = await im.user(phone);
-  const space = await im.space(user);
-
-  let msg: unknown;
-  if (respondingTo) {
-    msg = await space.send(text);
-  } else {
-    msg = await space.send(text);
-  }
+  const msg = await withReconnect("send", async () => {
+    const user = await im.user(phone);
+    const space = await im.space(user);
+    return await space.send(text);
+  });
 
   const id =
     (msg as any)?.id ??
@@ -100,8 +161,10 @@ async function handleGetSpace(body: Record<string, string>) {
   const { phone } = body;
   if (!phone) throw new Error("phone is required");
 
-  const user = await im.user(phone);
-  const space = await im.space(user);
+  const space = await withReconnect("get-space", async () => {
+    const user = await im.user(phone);
+    return await im.space(user);
+  });
 
   return {
     ok: true,
@@ -114,11 +177,12 @@ async function handleTyping(body: Record<string, string>, start: boolean) {
   const { phone } = body;
   if (!phone) throw new Error("phone is required");
 
-  const user = await im.user(phone);
-  const space = await im.space(user);
-
-  if (start) await space.startTyping();
-  else await space.stopTyping();
+  await withReconnect(start ? "typing/start" : "typing/stop", async () => {
+    const user = await im.user(phone);
+    const space = await im.space(user);
+    if (start) await space.startTyping();
+    else await space.stopTyping();
+  });
 
   return { ok: true };
 }
@@ -129,9 +193,12 @@ async function handleSendAttachment(body: Record<string, string>) {
 
   const { attachment } = await import("spectrum-ts");
   const buf = Buffer.from(base64, "base64");
-  const user = await im.user(phone);
-  const space = await im.space(user);
-  const msg = await space.send(attachment(buf, { name: filename, mimeType: mime }));
+
+  const msg = await withReconnect("send-attachment", async () => {
+    const user = await im.user(phone);
+    const space = await im.space(user);
+    return await space.send(attachment(buf, { name: filename, mimeType: mime }));
+  });
 
   const id =
     (msg as any)?.id ??
@@ -182,7 +249,7 @@ const ROUTES: Record<string, (body: Record<string, string>) => Promise<unknown>>
 };
 
 const server = createServer(async (req, res) => {
-  if (req.url !== '/health' && !isAuthorized(req)) {
+  if (req.url !== "/health" && !isAuthorized(req)) {
     return json(res, 401, { error: "unauthorized" });
   }
 
@@ -195,7 +262,7 @@ const server = createServer(async (req, res) => {
   }
 
   try {
-    const body = (req.method === 'GET'
+    const body = (req.method === "GET"
       ? Object.fromEntries(url2.searchParams.entries())
       : await readBody(req)) as Record<string, string>;
     const result = await handler(body);
