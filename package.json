@@ -1,0 +1,22 @@
+{
+  "name": "spectrum-relay",
+  "version": "1.0.0",
+  "description": "HTTP relay pour spectrum-ts — pont entre Cloudflare Workers et gRPC Spectrum",
+  "type": "module",
+  "scripts": {
+    "start": "node --import tsx/esm relay.ts",
+    "build": "tsc",
+    "start:compiled": "node dist/relay.js"
+  },
+  "dependencies": {
+    "spectrum-ts": "1.18.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.0.0",
+    "typescript": "^5.0.0",
+    "@types/node": "^20.0.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
