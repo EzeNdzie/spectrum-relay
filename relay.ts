@@ -44,6 +44,8 @@ const CONNECTION_ERROR_PATTERNS = [
   "econnreset",
   "socket hang up",
   "stream closed",
+  "stream dead",
+  "timeout",
   "upstream",
 ];
 
@@ -53,6 +55,40 @@ function isConnectionError(err: unknown): boolean {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/**
+ * Transforme un blocage en erreur. Si `fn` ne résout pas en `ms`, on rejette
+ * avec un message contenant "connection" → withReconnect le traite comme une
+ * erreur de connexion et reconnecte + retry. Sans ça, un space.send() sur une
+ * connexion zombie reste suspendu à l'infini (ni 200, ni 500 : juste le silence).
+ */
+function withTimeout<T>(fn: () => Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const t = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(new Error(`${label} timeout après ${ms}ms (connection stream dead)`));
+    }, ms);
+    fn().then(
+      (v) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(t);
+        resolve(v);
+      },
+      (e) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(t);
+        reject(e);
+      },
+    );
+  });
+}
+
+/** Timeout par opération Spectrum (envoi/typing). Au-delà = connexion morte. */
+const SPECTRUM_OP_TIMEOUT_MS = parseInt(process.env.SPECTRUM_OP_TIMEOUT_MS ?? "8000", 10);
 
 // Dédupe : si plusieurs requêtes échouent en même temps, elles partagent
 // la même reconnexion au lieu d'en déclencher une chacune.
@@ -135,9 +171,9 @@ async function handleSend(body: Record<string, string>) {
   console.log("[relay] send attempt:", { phone, textLen: text?.length });
 
   const msg = await withReconnect("send", async () => {
-    const user = await im.user(phone);
-    const space = await im.space(user);
-    return await space.send(text);
+    const user = await withTimeout(() => im.user(phone), SPECTRUM_OP_TIMEOUT_MS, "send.user");
+    const space = await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "send.space");
+    return await withTimeout(() => space.send(text), SPECTRUM_OP_TIMEOUT_MS, "send.send");
   });
 
   const id =
@@ -162,8 +198,8 @@ async function handleGetSpace(body: Record<string, string>) {
   if (!phone) throw new Error("phone is required");
 
   const space = await withReconnect("get-space", async () => {
-    const user = await im.user(phone);
-    return await im.space(user);
+    const user = await withTimeout(() => im.user(phone), SPECTRUM_OP_TIMEOUT_MS, "get-space.user");
+    return await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "get-space.space");
   });
 
   return {
@@ -178,10 +214,10 @@ async function handleTyping(body: Record<string, string>, start: boolean) {
   if (!phone) throw new Error("phone is required");
 
   await withReconnect(start ? "typing/start" : "typing/stop", async () => {
-    const user = await im.user(phone);
-    const space = await im.space(user);
-    if (start) await space.startTyping();
-    else await space.stopTyping();
+    const user = await withTimeout(() => im.user(phone), SPECTRUM_OP_TIMEOUT_MS, "typing.user");
+    const space = await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "typing.space");
+    if (start) await withTimeout(() => space.startTyping(), SPECTRUM_OP_TIMEOUT_MS, "typing.start");
+    else await withTimeout(() => space.stopTyping(), SPECTRUM_OP_TIMEOUT_MS, "typing.stop");
   });
 
   return { ok: true };
@@ -195,9 +231,9 @@ async function handleSendAttachment(body: Record<string, string>) {
   const buf = Buffer.from(base64, "base64");
 
   const msg = await withReconnect("send-attachment", async () => {
-    const user = await im.user(phone);
-    const space = await im.space(user);
-    return await space.send(attachment(buf, { name: filename, mimeType: mime }));
+    const user = await withTimeout(() => im.user(phone), SPECTRUM_OP_TIMEOUT_MS, "att.user");
+    const space = await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "att.space");
+    return await withTimeout(() => space.send(attachment(buf, { name: filename, mimeType: mime })), SPECTRUM_OP_TIMEOUT_MS, "att.send");
   });
 
   const id =
