@@ -90,6 +90,29 @@ function withTimeout<T>(fn: () => Promise<T>, ms: number, label: string): Promis
 /** Timeout par opération Spectrum (envoi/typing). Au-delà = connexion morte. */
 const SPECTRUM_OP_TIMEOUT_MS = parseInt(process.env.SPECTRUM_OP_TIMEOUT_MS ?? "8000", 10);
 
+// ─── Déduplication des envois (clientGuid) ─────────────────────────────────────
+//
+// Lovable retry /send (avec le MÊME clientGuid) quand il n'a pas reçu de
+// providerMessageId. Or "200 sans GUID" peut signifier que le message EST parti
+// mais que Spectrum n'a pas confirmé d'id. Sans dédup ici, le retry renverrait
+// le message une 2e fois → doublon ("type Élodie"). On mémorise donc le
+// résultat par clientGuid : un retry avec un clientGuid déjà vu renvoie le
+// résultat mémorisé SANS ré-émettre vers Spectrum.
+
+type SendResult = { ok: true; clientGuid: string; id: string };
+const SEND_DEDUP_TTL_MS = parseInt(process.env.SEND_DEDUP_TTL_MS ?? "600000", 10); // 10 min
+const sendCache = new Map<string, { at: number; result: SendResult }>();
+// In-flight : si un 2e appel arrive pendant que le 1er est encore en cours
+// d'envoi, il attend le même résultat au lieu de lancer un 2e envoi.
+const sendInflight = new Map<string, Promise<SendResult>>();
+
+function cacheCleanup() {
+  const now = Date.now();
+  for (const [k, v] of sendCache) {
+    if (now - v.at > SEND_DEDUP_TTL_MS) sendCache.delete(k);
+  }
+}
+
 // Dédupe : si plusieurs requêtes échouent en même temps, elles partagent
 // la même reconnexion au lieu d'en déclencher une chacune.
 let reconnecting: Promise<void> | null = null;
@@ -166,25 +189,59 @@ function json(res: ServerResponse, status: number, body: unknown) {
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
 
-async function handleSend(body: Record<string, string>) {
+async function handleSend(body: Record<string, string>): Promise<SendResult> {
   const { phone, text, clientGuid } = body;
-  console.log("[relay] send attempt:", { phone, textLen: text?.length });
+  console.log("[relay] send attempt:", { phone, textLen: text?.length, clientGuid });
 
-  const msg = await withReconnect("send", async () => {
-    const user = await withTimeout(() => im.user(phone), SPECTRUM_OP_TIMEOUT_MS, "send.user");
-    const space = await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "send.space");
-    return await withTimeout(() => space.send(text), SPECTRUM_OP_TIMEOUT_MS, "send.send");
-  });
+  // Dédup : ce clientGuid a-t-il déjà été envoyé (ou est-il en cours) ?
+  if (clientGuid) {
+    cacheCleanup();
+    const cached = sendCache.get(clientGuid);
+    if (cached) {
+      console.log("[relay] send dedup HIT (déjà envoyé) :", clientGuid);
+      return cached.result;
+    }
+    const inflight = sendInflight.get(clientGuid);
+    if (inflight) {
+      console.log("[relay] send dedup WAIT (envoi en cours) :", clientGuid);
+      return inflight;
+    }
+  }
 
-  const id =
-    (msg as any)?.id ??
-    (msg as any)?.clientGuid ??
-    (msg as any)?.guid ??
-    (msg as any)?.messageId ??
-    clientGuid ??
-    crypto.randomUUID();
+  const doSend = (async (): Promise<SendResult> => {
+    const msg = await withReconnect("send", async () => {
+      const user = await withTimeout(() => im.user(phone), SPECTRUM_OP_TIMEOUT_MS, "send.user");
+      const space = await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "send.space");
+      return await withTimeout(() => space.send(text), SPECTRUM_OP_TIMEOUT_MS, "send.send");
+    });
 
-  return { ok: true, clientGuid: id, id };
+    const realProviderId =
+      (msg as any)?.id ??
+      (msg as any)?.guid ??
+      (msg as any)?.messageId;
+
+    const id = realProviderId ?? (msg as any)?.clientGuid ?? clientGuid ?? crypto.randomUUID();
+
+    const result: SendResult = { ok: true, clientGuid: id, id };
+
+    // On ne mémorise (= on ne bloque les futurs retries) QUE si Spectrum a
+    // renvoyé un vrai id. Si pas d'id réel, Lovable repassera en retry : on
+    // veut laisser ce retry retenter un vrai envoi, donc on ne cache PAS.
+    if (clientGuid && realProviderId) {
+      sendCache.set(clientGuid, { at: Date.now(), result });
+    }
+    return result;
+  })();
+
+  if (clientGuid) {
+    sendInflight.set(clientGuid, doSend);
+    try {
+      return await doSend;
+    } finally {
+      sendInflight.delete(clientGuid);
+    }
+  }
+  return doSend;
 }
 
 async function handleMarkRead(body: Record<string, string>) {
