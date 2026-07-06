@@ -303,8 +303,9 @@ async function handleSendAttachment(body: Record<string, string>) {
 }
 
 async function handleGetAttachment(body: Record<string, string>) {
-  const { guid, phone } = body;
-  if (!guid || !phone) throw new Error("guid and phone are required");
+  const guid = body.guid ?? body.id; // Lovable envoie `id`, on accepte les deux
+  const { phone } = body;
+  if (!guid || !phone) throw new Error("guid/id and phone are required");
 
   console.log("[relay] get-attachment attempt:", { guid, phone });
 
@@ -339,6 +340,7 @@ const ROUTES: Record<string, (body: Record<string, string>) => Promise<unknown>>
   "POST /typing/stop":     (b) => handleTyping(b, false),
   "POST /send-attachment": (b) => handleSendAttachment(b),
   "GET /get-attachment":   (b) => handleGetAttachment(b),
+  "POST /get-attachment":  (b) => handleGetAttachment(b),
 };
 
 const server = createServer(async (req, res) => {
