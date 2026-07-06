@@ -19,7 +19,12 @@ import { imessage } from "spectrum-ts/providers/imessage";
 // ─── Connexion Spectrum (avec reconnexion) ─────────────────────────────────────
 
 let app: Awaited<ReturnType<typeof Spectrum>>;
-let im: ReturnType<typeof imessage>;
+// Le SDK spectrum-ts a des types stricts qui n'exposent pas user()/space()/
+// getAttachment() tels qu'on les appelle (alors que les méthodes existent bien
+// à l'exécution, cf. doc). On type `im` en `any` pour laisser passer le build ;
+// on perd la vérif de types sur ces appels, mais ils sont corrects au runtime.
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let im: any;
 
 async function connect() {
   app = await Spectrum({
@@ -211,7 +216,7 @@ async function handleSend(body: Record<string, string>): Promise<SendResult> {
   const doSend = (async (): Promise<SendResult> => {
     const msg = await withReconnect("send", async () => {
       const user = await withTimeout(() => im.user(phone), SPECTRUM_OP_TIMEOUT_MS, "send.user");
-      const space = await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "send.space");
+      const space: any = await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "send.space");
       return await withTimeout(() => space.send(text), SPECTRUM_OP_TIMEOUT_MS, "send.send");
     });
 
@@ -272,7 +277,7 @@ async function handleTyping(body: Record<string, string>, start: boolean) {
 
   await withReconnect(start ? "typing/start" : "typing/stop", async () => {
     const user = await withTimeout(() => im.user(phone), SPECTRUM_OP_TIMEOUT_MS, "typing.user");
-    const space = await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "typing.space");
+    const space: any = await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "typing.space");
     if (start) await withTimeout(() => space.startTyping(), SPECTRUM_OP_TIMEOUT_MS, "typing.start");
     else await withTimeout(() => space.stopTyping(), SPECTRUM_OP_TIMEOUT_MS, "typing.stop");
   });
@@ -289,7 +294,7 @@ async function handleSendAttachment(body: Record<string, string>) {
 
   const msg = await withReconnect("send-attachment", async () => {
     const user = await withTimeout(() => im.user(phone), SPECTRUM_OP_TIMEOUT_MS, "att.user");
-    const space = await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "att.space");
+    const space: any = await withTimeout(() => im.space(user), SPECTRUM_OP_TIMEOUT_MS, "att.space");
     return await withTimeout(() => space.send(attachment(buf, { name: filename, mimeType: mime })), SPECTRUM_OP_TIMEOUT_MS, "att.send");
   });
 
