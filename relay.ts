@@ -305,28 +305,31 @@ async function handleSendAttachment(body: Record<string, string>) {
 async function handleGetAttachment(body: Record<string, string>) {
   const guid = body.guid ?? body.id; // Lovable envoie `id`, on accepte les deux
   const { phone } = body;
-  if (!guid || !phone) throw new Error("guid/id and phone are required");
+  if (!guid) throw new Error("guid/id is required");
 
   console.log("[relay] get-attachment attempt:", { guid, phone });
 
-  const projectId = process.env.PROJECT_ID!;
-  const projectSecret = process.env.PROJECT_SECRET!;
-
-  const resp = await fetch(
-    `https://spectrum.photon.codes/projects/${projectId}/attachments/${guid}`,
-    {
-      headers: {
-        Authorization: `Basic ${Buffer.from(`${projectId}:${projectSecret}`).toString("base64")}`,
-      },
-    }
+  // Il n'y a PAS d'endpoint REST public pour DL un attachment : Spectrum passe
+  // par le SDK (gRPC/WS propriétaire). On utilise donc im.getAttachment(guid,
+  // phone) → .read(), via la même connexion que le reste, avec timeout + retry.
+  const att = await withReconnect("get-attachment", async () =>
+    withTimeout(() => im.getAttachment(guid, phone), SPECTRUM_OP_TIMEOUT_MS, "get-attachment"),
   );
 
-  if (!resp.ok) throw new Error(`Spectrum attachment fetch failed: ${resp.status}`);
+  if (!att) {
+    // Attachment introuvable côté Spectrum (guid inconnu / expiré).
+    const err = new Error("attachment not found") as Error & { statusCode?: number };
+    err.statusCode = 404;
+    throw err;
+  }
 
-  const mimeType = resp.headers.get("content-type") ?? "image/jpeg";
-  const buffer = Buffer.from(await resp.arrayBuffer());
+  const bytes: Buffer = Buffer.from(
+    await withTimeout(() => (att as any).read(), SPECTRUM_OP_TIMEOUT_MS, "get-attachment.read"),
+  );
+  const mimeType = (att as any).mimeType ?? "application/octet-stream";
+  const name = (att as any).fileName ?? "attachment";
 
-  return { ok: true, base64: buffer.toString("base64"), mimeType };
+  return { ok: true, base64: bytes.toString("base64"), mimeType, name };
 }
 
 // ─── HTTP Server ─────────────────────────────────────────────────────────────
@@ -364,8 +367,9 @@ const server = createServer(async (req, res) => {
     json(res, 200, result);
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
+    const statusCode = (err as { statusCode?: number })?.statusCode ?? 500;
     console.error(`[relay] ${routeKey} failed:`, message);
-    json(res, 500, { error: message });
+    json(res, statusCode, { error: message });
   }
 });
 
